@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "matplotlib",
     "akshare",
+    "baostock",
     "pandas-ta",
     "scikit-learn",
     "tables",  # 用于HDF5

@@ -1,5 +1,6 @@
 import os
 import json
+
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from modules.data_fetcher import StockDataFetcher
 from modules.technical_analyzer import TechnicalAnalyzer
@@ -89,21 +90,45 @@ def serve_chart(filename):
 
 @app.route('/stock_info/<stock_code>')
 def get_stock_info(stock_code):
-    """获取股票基本信息"""
+    """获取股票基本信息（双数据源）"""
+    # 尝试 Baostock（无需联网的 HTTP API，外网可用）
+    try:
+        import baostock as bs
+        code = stock_code.lstrip('sz').lstrip('sh').lstrip('SZ').lstrip('SH').zfill(6)
+        bs_code = f"sh.{code}" if code.startswith(('6', '9')) else f"sz.{code}"
+        bs.login()
+        rs = bs.query_stock_basic(code=bs_code)
+        data = rs.get_data()
+        bs.logout()
+        if not data.empty:
+            info_dict = {
+                '股票代码': data['code'].values[0],
+                '股票名称': data['code_name'].values[0],
+                '上市日期': data.get('ipoDate', pd.Series([''])).values[0],
+                '类型': data['type'].values[0],
+            }
+            return jsonify({'success': True, 'data': info_dict})
+    except Exception:
+        pass
+
+    # 备选 AKShare
     try:
         import akshare as ak
         stock_info = ak.stock_individual_info_em(symbol=stock_code)
         if not stock_info.empty:
-            # 转换为字典列表
             info_dict = {
-                row['item']: row['value'] 
+                row['item']: row['value']
                 for _, row in stock_info.iterrows()
             }
             return jsonify({'success': True, 'data': info_dict})
-        else:
-            return jsonify({'error': f'未找到股票 {stock_code} 的信息'}), 404
     except Exception as e:
         return jsonify({'error': f'获取股票信息时出错: {str(e)}'}), 500
 
+    return jsonify({'error': f'未找到股票 {stock_code} 的信息'}), 404
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=False)  # 禁用多线程
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=int(os.environ.get('FLASK_PORT', 5005)))
+    args = parser.parse_args()
+    app.run(debug=True, host='0.0.0.0', port=args.port, threaded=False)

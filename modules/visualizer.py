@@ -16,6 +16,41 @@ class Visualizer:
         # 设置matplotlib中文显示
         plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
         plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+    def _get_stock_name(self, stock_code: str) -> str:
+        """获取股票名称，AKShare 优先，Baostock 备选。"""
+        code = stock_code.lstrip('sz').lstrip('sh').lstrip('SZ').lstrip('SH').rstrip(
+            '.sz').rstrip('.sh').rstrip('.SZ').rstrip('.SH').zfill(6)
+        bs_code = f"sh.{code}" if code.startswith(('6', '9')) else f"sz.{code}"
+
+        # 尝试 Baostock
+        try:
+            import baostock as bs
+            bs.login()
+            rs = bs.query_stock_basic(code=bs_code)
+            data = rs.get_data()
+            bs.logout()
+            if not data.empty and 'code_name' in data.columns:
+                name = data['code_name'].values[0]
+                if name:
+                    return name
+        except Exception:
+            pass
+
+        # 尝试 AKShare
+        try:
+            import akshare as ak
+            stock_info = ak.stock_individual_info_em(symbol=code)
+            if not stock_info.empty:
+                name = stock_info.loc[
+                    stock_info['item'] == '股票简称', 'value'
+                ].values
+                if len(name) > 0:
+                    return name[0]
+        except Exception:
+            pass
+
+        return stock_code
     
     def create_charts(self, stock_data, indicators, stock_code, save_path):
         """
@@ -33,16 +68,9 @@ class Visualizer:
         if stock_data.empty:
             return ""
         
-        # 获取股票名称
-        try:
-            import akshare as ak
-            stock_info = ak.stock_individual_info_em(symbol=stock_code)
-            if not stock_info.empty:
-                stock_name = stock_info.loc[stock_info['item'] == '股票简称', 'value'].values[0]
-            else:
-                stock_name = stock_code
-        except:
-            stock_name = stock_code
+        # 获取股票名称（AKShare 优先，Baostock 备选）
+        stock_name = self._get_stock_name(stock_code)
+
         
         # 创建保存目录
         chart_dir = os.path.join(save_path, 'charts')
