@@ -1,4 +1,5 @@
 import os
+import httpx
 from PIL import Image
 import pandas as pd
 import json
@@ -15,46 +16,75 @@ logging.basicConfig(level=logging.DEBUG, format='%(threadName)s: %(message)s')
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
-BASE_URL = os.getenv("BASE_URL", "")          # 如留空则用 Gemini SDK
+BASE_URL = os.getenv("BASE_URL", "").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.0-flash-exp")
 USE_GEMINI_SDK = os.getenv("USE_GEMINI_SDK", "false").lower() in ("true", "1", "yes")
 
 
+def _detect_provider(base_url: str) -> str:
+    """根据 BASE_URL 自动识别 AI 提供商。
+
+    返回值：
+        "gemini-official"  - Google 官方 Gemini API
+        "openai"          - OpenAI API (api.openai.com)
+        "custom"           - 第三方兼容接口（自定义域名）
+    """
+    if not base_url:
+        return "gemini-official"
+    lower = base_url.lower()
+    if "generativelanguage.googleapis.com" in lower:
+        return "gemini-official"
+    if "api.openai.com" in lower:
+        return "openai"
+    return "custom"
+
+
 class AIAnalyzer:
     """
-    AI分析类，支持两种调用模式：
-      1. OpenAI 兼容接口（通过 BASE_URL 配置）
-      2. Google 官方 Gemini SDK（直接调用 Gemini API）
+    AI 分析类，支持多模型智能路由：
+      - BASE_URL 为空        → Google 官方 Gemini SDK
+      - generativelanguage  → Gemini REST API（httpx 直调）
+      - api.openai.com      → OpenAI REST API（httpx 直调）
+      - 其他自定义域名       → httpx 直调（自行拼接 /chat/completions）
     """
 
     def __init__(self):
+        self._client = None
+        self._mode = None
+
         if not API_KEY:
-            self._client = None
-            self._mode = None
             print("警告: 未设置 API_KEY 环境变量，AI 分析功能将无法使用")
             return
 
-        # 优先使用 OpenAI 兼容模式（BASE_URL 非空时）
+        provider = _detect_provider(BASE_URL)
+
+        # 模式一：Google 官方 Gemini SDK（绕过 BASE_URL）
         if USE_GEMINI_SDK:
             from google import genai
             from google.genai import types
             self._genai_types = types
             self._client = genai.Client(api_key=API_KEY)
             self._mode = "gemini-sdk"
-            print(f"[AI] 使用 Gemini SDK 模式，模型: {MODEL_NAME}")
-        elif BASE_URL:
+            print(f"[AI] 模式: Gemini SDK，模型: {MODEL_NAME}")
+            return
+
+        # 模式二：Google Gemini REST API
+        if provider == "gemini-official":
+            self._mode = "gemini-rest"
+            print(f"[AI] 模式: Gemini REST API，BASE_URL: {BASE_URL or '(默认)'}，模型: {MODEL_NAME}")
+            return
+
+        # 模式三：OpenAI REST API（标准路径 /v1/chat/completions）
+        if provider == "openai":
             from openai import OpenAI
             self._client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-            self._mode = "openai-compatible"
-            print(f"[AI] 使用 OpenAI 兼容模式，base_url: {BASE_URL}，模型: {MODEL_NAME}")
-        else:
-            # 回退到 Gemini SDK
-            from google import genai
-            from google.genai import types
-            self._genai_types = types
-            self._client = genai.Client(api_key=API_KEY)
-            self._mode = "gemini-sdk"
-            print(f"[AI] 未配置 BASE_URL，自动切换到 Gemini SDK 模式，模型: {MODEL_NAME}")
+            self._mode = "openai-sdk"
+            print(f"[AI] 模式: OpenAI SDK，base_url: {BASE_URL}，模型: {MODEL_NAME}")
+            return
+
+        # 模式四：第三方兼容接口（自定义域名，httpx 直调，自行拼接 /chat/completions）
+        self._mode = "custom-httpx"
+        print(f"[AI] 模式: 自定义代理（httpx），base_url: {BASE_URL}，模型: {MODEL_NAME}")
 
     def _get_stock_name(self, stock_code: str) -> str:
         """获取股票名称，Baostock 优先，AKShare 备选。"""
@@ -92,13 +122,9 @@ class AIAnalyzer:
     def analyze(self, stock_data, indicators, financial_data, news_data, stock_code, save_path):
         """
         使用 AI 分析股票数据并预测未来走势。
-        自动根据 .env 配置选择 OpenAI 兼容接口或 Gemini SDK。
         """
         if not API_KEY:
             return "错误: 未设置 API_KEY 环境变量，无法使用 AI 分析功能。请在 .env 文件中添加 API_KEY。"
-
-        if self._client is None:
-            return f"错误: AI 客户端初始化失败（模式: {self._mode}），请检查 .env 配置。"
 
         try:
             logging.debug(f"运行 analyze 方法的线程: {threading.current_thread().name}")
@@ -120,10 +146,17 @@ class AIAnalyzer:
                 img.close()
 
             # 根据模式调用对应的 API
-            if self._mode == "gemini-sdk":
-                analysis_result = self._call_gemini_sdk(prompt, img_bytes, MODEL_NAME)
+            mode = self._mode or "unknown"
+            if mode == "gemini-sdk":
+                analysis_result = self._call_gemini_sdk(prompt, img_bytes)
+            elif mode == "gemini-rest":
+                analysis_result = self._call_gemini_rest(prompt, img_bytes)
+            elif mode == "openai-sdk":
+                analysis_result = self._call_openai_sdk(prompt, img_base64)
+            elif mode == "custom-httpx":
+                analysis_result = self._call_custom_httpx(prompt, img_base64)
             else:
-                analysis_result = self._call_openai_compatible(prompt, img_base64, MODEL_NAME)
+                return f"错误: 未知的 AI 调用模式: {mode}"
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             disclaimer = (
@@ -139,10 +172,22 @@ class AIAnalyzer:
         except Exception as e:
             return f"AI 分析过程中出错: {str(e)}"
 
-    def _call_gemini_sdk(self, prompt: str, img_bytes: bytes, model: str) -> str:
+    # ── 代理支持 ──────────────────────────────────────────────────────────────
+
+    def _build_client(self) -> httpx.Client:
+        """构造 httpx 客户端，自动读取 HTTPS_PROXY 环境变量。"""
+        proxies = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        timeout = httpx.Timeout(120.0, connect=30.0)
+        if proxies:
+            return httpx.Client(proxies=proxies, timeout=timeout)
+        return httpx.Client(timeout=timeout)
+
+    # ── Gemini 官方 SDK ───────────────────────────────────────────────────────
+
+    def _call_gemini_sdk(self, prompt: str, img_bytes: bytes) -> str:
         """通过 Google 官方 Gemini SDK 调用。"""
         response = self._client.models.generate_content(
-            model=model,
+            model=MODEL_NAME,
             contents=[
                 self._genai_types.Content(
                     parts=[
@@ -165,10 +210,54 @@ class AIAnalyzer:
         )
         return response.text
 
-    def _call_openai_compatible(self, prompt: str, img_base64: str, model: str) -> str:
-        """通过 OpenAI 兼容接口调用（BASE_URL + OpenAI SDK）。"""
+    # ── Gemini REST API ───────────────────────────────────────────────────────
+
+    def _call_gemini_rest(self, prompt: str, img_bytes: bytes) -> str:
+        """通过 Gemini REST API 调用（httpx 直调）。"""
+        # Gemini REST API 固定路径格式：/v1beta/models/{model}:generateContent
+        # API key 通过 x-goog-api-key header 传递（不放在 URL 里）
+        base = BASE_URL.rstrip('/') if BASE_URL else "https://generativelanguage.googleapis.com"
+        url = f"{base}/v1beta/models/{MODEL_NAME}:generateContent"
+
+        headers = {
+            "x-goog-api-key": API_KEY,
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(img_bytes).decode("utf-8")}}
+                ]
+            }],
+            "systemInstruction": {
+                "parts": [{"text": "你是一位专业的股票分析师，请基于以下数据分析股票的K线图和基本面情况，并预测上涨的概率。"}]
+            },
+            "generationConfig": {
+                "temperature": 0,
+                "topP": 0.95,
+                "candidateCount": 1,
+            }
+        }
+
+        with self._build_client() as client:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+
+        # 解析响应文本
+        try:
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            return str(result)
+
+    # ── OpenAI SDK ────────────────────────────────────────────────────────────
+
+    def _call_openai_sdk(self, prompt: str, img_base64: str) -> str:
+        """通过 OpenAI SDK 调用（api.openai.com）。"""
         response = self._client.chat.completions.create(
-            model=model,
+            model=MODEL_NAME,
             messages=[
                 {
                     "role": "system",
@@ -178,10 +267,7 @@ class AIAnalyzer:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{img_base64}"}
-                        }
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
                     ]
                 }
             ],
@@ -189,6 +275,47 @@ class AIAnalyzer:
             top_p=0.95,
         )
         return response.choices[0].message.content
+
+    # ── 第三方兼容接口（自定义域名）──────────────────────────────────────────
+
+    def _call_custom_httpx(self, prompt: str, img_base64: str) -> str:
+        """通过 httpx 直调第三方兼容接口，自行拼接 /chat/completions。"""
+        if not BASE_URL:
+            return "错误: BASE_URL 未配置，无法使用自定义代理模式。"
+
+        url = f"{BASE_URL.rstrip('/')}/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一位专业的股票分析师，请基于以下数据分析股票的K线图和基本面情况，并预测上涨的概率。"
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                    ]
+                }
+            ],
+            "temperature": 0,
+            "top_p": 0.95,
+        }
+
+        with self._build_client() as client:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+
+        return result["choices"][0]["message"]["content"]
+
+    # ── 数据准备 ──────────────────────────────────────────────────────────────
 
     def _prepare_analysis_data(self, stock_data, indicators, financial_data, news_data,
                                stock_code, stock_name):
